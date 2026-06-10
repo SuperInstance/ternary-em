@@ -1,4 +1,6 @@
 [package]
+description = "ternary-em - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/ternary-em"
 name = "ternary-em"
 version = "0.1.0"
 edition = "2024"
