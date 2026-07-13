@@ -632,4 +632,84 @@ mod tests {
         assert!((d.log_pmf(1) - 0.2_f64.ln()).abs() < 1e-10);
         assert_eq!(d.log_pmf(2), f64::NEG_INFINITY);
     }
+
+    // ── Numerical-stability / degenerate-input coverage ──
+
+    #[test]
+    fn test_floor_keeps_log_likelihood_finite_for_unsupported_value() {
+        // A point-mass component (always -1) seeing a +1 would, without the
+        // floor, make pmf(+1) = 0 and ln(0) = -inf. The floor must keep the
+        // log-likelihood finite and the E-step responsibilities valid.
+        let em = TernaryEM::new(vec![MixtureComponent {
+            weight: 1.0,
+            distribution: TernaryDistribution::new(1.0, 0.0, 0.0),
+        }]);
+        let data = vec![1_i8];
+        let ll = em.log_likelihood(&data);
+        assert!(ll.is_finite(), "floor must prevent -inf log-likelihood, got {ll}");
+
+        let resp = em.e_step(&data);
+        let sum: f64 = resp[0].iter().sum();
+        assert!((sum - 1.0).abs() < 1e-12, "responsibilities must still sum to 1");
+    }
+
+    #[test]
+    fn test_all_identical_data_runs_without_panic() {
+        // Degenerate dataset where every point is identical: the M-step drives
+        // the responsible component toward a point mass. Verify no panic, finite
+        // LL, and that responsibilities remain valid probabilities.
+        let data = vec![0_i8; 50];
+        let result = TernaryEM::new(vec![
+            MixtureComponent {
+                weight: 0.5,
+                distribution: TernaryDistribution::new(0.2, 0.6, 0.2),
+            },
+            MixtureComponent {
+                weight: 0.5,
+                distribution: TernaryDistribution::new(0.3, 0.4, 0.3),
+            },
+        ])
+        .fit(&data);
+
+        assert!(result.log_likelihood.is_finite());
+        // The two near-symmetric components should both concentrate mass on 0.
+        for c in &result.components {
+            assert!(
+                c.distribution.p_zero > 0.9,
+                "components should collapse toward the only observed value (0)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_point_mass_distribution_has_zero_variance() {
+        // A deterministic distribution over {-1, 0, +1} has zero variance and
+        // no division-by-variance anywhere, so this must not be a special case.
+        let d = TernaryDistribution::new(0.0, 1.0, 0.0);
+        assert!(d.variance().abs() < 1e-15);
+        assert!((d.mean()).abs() < 1e-15);
+        assert!((d.pmf(0) - 1.0).abs() < 1e-15);
+        assert!((d.pmf(-1)).abs() < 1e-15);
+        assert!((d.pmf(1)).abs() < 1e-15);
+    }
+
+    #[test]
+    #[should_panic(expected = "Probabilities must sum to a positive number")]
+    fn test_new_rejects_all_zero_probabilities() {
+        // Documented behavior: (0, 0, 0) is not a valid distribution and panics.
+        let _ = TernaryDistribution::new(0.0, 0.0, 0.0);
+    }
+
+    #[test]
+    fn test_js_divergence_bounded_by_ln2() {
+        // JS divergence (equal-weight) is bounded above by ln(2).
+        let p = TernaryDistribution::new(1.0, 0.0, 0.0);
+        let q = TernaryDistribution::new(0.0, 0.0, 1.0);
+        let js = js_divergence(&p, &q);
+        assert!(
+            js <= std::f64::consts::LN_2 + 1e-9,
+            "JS divergence must be bounded by ln(2), got {js}"
+        );
+        assert!(js > 0.0);
+    }
 }
