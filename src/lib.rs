@@ -7,7 +7,6 @@
 //! E-step responsibility computation, M-step parameter updates, and convergence
 //! detection via log-likelihood monitoring.
 
-
 /// A ternary probability distribution over {-1, 0, +1}.
 ///
 /// Probabilities must sum to 1.0 and all be non-negative.
@@ -179,8 +178,8 @@ impl TernaryEM {
             } else {
                 // Uniform fallback
                 let uniform = 1.0 / k as f64;
-                for j in 0..k {
-                    responsibilities[i][j] = uniform;
+                for r in &mut responsibilities[i] {
+                    *r = uniform;
                 }
             }
         }
@@ -193,16 +192,19 @@ impl TernaryEM {
     /// Updates weights and distribution parameters in place.
     pub fn m_step(&mut self, data: &[i8], responsibilities: &[Vec<f64>]) {
         let n = data.len();
-        let k = self.components.len();
 
-        for j in 0..k {
-            let n_k: f64 = data.iter().enumerate().map(|(i, _)| responsibilities[i][j]).sum();
+        for (j, comp) in self.components.iter_mut().enumerate() {
+            let n_k: f64 = data
+                .iter()
+                .enumerate()
+                .map(|(i, _)| responsibilities[i][j])
+                .sum();
             if n_k < self.config.floor {
                 continue;
             }
 
             // Update weight
-            self.components[j].weight = n_k / n as f64;
+            comp.weight = n_k / n as f64;
 
             // Update distribution: weighted counts
             let mut count_neg = 0.0;
@@ -221,7 +223,7 @@ impl TernaryEM {
 
             let total = count_neg + count_zero + count_pos;
             if total > 0.0 {
-                self.components[j].distribution = TernaryDistribution {
+                comp.distribution = TernaryDistribution {
                     p_neg: count_neg / total,
                     p_zero: count_zero / total,
                     p_pos: count_pos / total,
@@ -285,7 +287,7 @@ impl TernaryEM {
         assert!(n > 0 && k > 0);
 
         let weight = 1.0 / k as f64;
-        let chunk_size = (n + k - 1) / k;
+        let chunk_size = n.div_ceil(k);
 
         let components: Vec<MixtureComponent> = (0..k)
             .map(|j| {
@@ -399,7 +401,10 @@ mod tests {
             let sum: f64 = row.iter().sum();
             assert!((sum - 1.0).abs() < 1e-10, "Responsibilities must sum to 1");
             for &r in row {
-                assert!(r >= 0.0 && r <= 1.0, "Responsibilities must be in [0,1]");
+                assert!(
+                    (0.0..=1.0).contains(&r),
+                    "Responsibilities must be in [0,1]"
+                );
             }
         }
     }
@@ -603,7 +608,10 @@ mod tests {
         let q = TernaryDistribution::new(0.1, 0.3, 0.6);
         let js_pq = js_divergence(&p, &q);
         let js_qp = js_divergence(&q, &p);
-        assert!((js_pq - js_qp).abs() < 1e-10, "JS divergence should be symmetric");
+        assert!(
+            (js_pq - js_qp).abs() < 1e-10,
+            "JS divergence should be symmetric"
+        );
         assert!(js_pq >= 0.0);
     }
 
@@ -646,11 +654,17 @@ mod tests {
         }]);
         let data = vec![1_i8];
         let ll = em.log_likelihood(&data);
-        assert!(ll.is_finite(), "floor must prevent -inf log-likelihood, got {ll}");
+        assert!(
+            ll.is_finite(),
+            "floor must prevent -inf log-likelihood, got {ll}"
+        );
 
         let resp = em.e_step(&data);
         let sum: f64 = resp[0].iter().sum();
-        assert!((sum - 1.0).abs() < 1e-12, "responsibilities must still sum to 1");
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "responsibilities must still sum to 1"
+        );
     }
 
     #[test]
