@@ -424,9 +424,15 @@ mod tests {
         em.m_step(&data, &resp);
         let ll_after = em.log_likelihood(&data);
 
+        // Require a STRICT increase. The previous `>= ll_before - 1e-6` assertion
+        // is satisfied by equality, so it passed even when the M-step was a
+        // no-op that left the parameters untouched. Here the init is provably
+        // not a fixed point, so one real E+M step must strictly raise the
+        // log-likelihood (measured delta ≈ +0.049).
         assert!(
-            ll_after >= ll_before - 1e-6,
-            "M-step should not decrease likelihood: before={}, after={}",
+            ll_after > ll_before,
+            "M-step must strictly increase likelihood (a no-op M-step would tie): \
+             before={}, after={}",
             ll_before,
             ll_after
         );
@@ -550,16 +556,35 @@ mod tests {
                 distribution: TernaryDistribution::new(0.3, 0.3, 0.4),
             },
         ];
+
+        // Log-likelihood of the *initial* parameters, before any EM update.
+        let ll_init = TernaryEM::new(init.clone()).log_likelihood(&data);
         let result = TernaryEM::new(init).fit(&data);
 
+        // (1) Monotonicity: across iterations the log-likelihood must be
+        // non-decreasing up to floating-point rounding. Exact-arithmetic EM is
+        // monotone, but double precision can wiggle by ~1e-15, so use a tight
+        // documented tolerance rather than claiming bit-exact monotonicity.
         for window in result.ll_history.windows(2) {
             assert!(
-                window[1] >= window[0] - 1e-6,
-                "Log-likelihood should be non-decreasing: {} -> {}",
+                window[1] >= window[0] - 1e-9,
+                "Log-likelihood must be non-decreasing within float tolerance: {} -> {}",
                 window[0],
                 window[1]
             );
         }
+
+        // (2) The fitted model must strictly beat the initial one. This is what
+        // makes the test meaningful: a broken (no-op) M-step that never updates
+        // parameters leaves ll_final == ll_init, which check (1) alone cannot
+        // detect because a flat sequence trivially satisfies non-decreasing.
+        // Here the init is provably improvable, so EM must raise the LL.
+        assert!(
+            result.log_likelihood > ll_init,
+            "EM must strictly improve log-likelihood from the init: init={}, final={}",
+            ll_init,
+            result.log_likelihood
+        );
     }
 
     #[test]
