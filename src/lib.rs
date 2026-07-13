@@ -7,7 +7,6 @@
 //! E-step responsibility computation, M-step parameter updates, and convergence
 //! detection via log-likelihood monitoring.
 
-
 /// A ternary probability distribution over {-1, 0, +1}.
 ///
 /// Probabilities must sum to 1.0 and all be non-negative.
@@ -179,8 +178,8 @@ impl TernaryEM {
             } else {
                 // Uniform fallback
                 let uniform = 1.0 / k as f64;
-                for j in 0..k {
-                    responsibilities[i][j] = uniform;
+                for r in &mut responsibilities[i] {
+                    *r = uniform;
                 }
             }
         }
@@ -193,16 +192,19 @@ impl TernaryEM {
     /// Updates weights and distribution parameters in place.
     pub fn m_step(&mut self, data: &[i8], responsibilities: &[Vec<f64>]) {
         let n = data.len();
-        let k = self.components.len();
 
-        for j in 0..k {
-            let n_k: f64 = data.iter().enumerate().map(|(i, _)| responsibilities[i][j]).sum();
+        for (j, comp) in self.components.iter_mut().enumerate() {
+            let n_k: f64 = data
+                .iter()
+                .enumerate()
+                .map(|(i, _)| responsibilities[i][j])
+                .sum();
             if n_k < self.config.floor {
                 continue;
             }
 
             // Update weight
-            self.components[j].weight = n_k / n as f64;
+            comp.weight = n_k / n as f64;
 
             // Update distribution: weighted counts
             let mut count_neg = 0.0;
@@ -221,7 +223,7 @@ impl TernaryEM {
 
             let total = count_neg + count_zero + count_pos;
             if total > 0.0 {
-                self.components[j].distribution = TernaryDistribution {
+                comp.distribution = TernaryDistribution {
                     p_neg: count_neg / total,
                     p_zero: count_zero / total,
                     p_pos: count_pos / total,
@@ -285,7 +287,7 @@ impl TernaryEM {
         assert!(n > 0 && k > 0);
 
         let weight = 1.0 / k as f64;
-        let chunk_size = (n + k - 1) / k;
+        let chunk_size = n.div_ceil(k);
 
         let components: Vec<MixtureComponent> = (0..k)
             .map(|j| {
@@ -399,7 +401,10 @@ mod tests {
             let sum: f64 = row.iter().sum();
             assert!((sum - 1.0).abs() < 1e-10, "Responsibilities must sum to 1");
             for &r in row {
-                assert!(r >= 0.0 && r <= 1.0, "Responsibilities must be in [0,1]");
+                assert!(
+                    (0.0..=1.0).contains(&r),
+                    "Responsibilities must be in [0,1]"
+                );
             }
         }
     }
@@ -424,9 +429,15 @@ mod tests {
         em.m_step(&data, &resp);
         let ll_after = em.log_likelihood(&data);
 
+        // Require a STRICT increase. The previous `>= ll_before - 1e-6` assertion
+        // is satisfied by equality, so it passed even when the M-step was a
+        // no-op that left the parameters untouched. Here the init is provably
+        // not a fixed point, so one real E+M step must strictly raise the
+        // log-likelihood (measured delta ≈ +0.049).
         assert!(
-            ll_after >= ll_before - 1e-6,
-            "M-step should not decrease likelihood: before={}, after={}",
+            ll_after > ll_before,
+            "M-step must strictly increase likelihood (a no-op M-step would tie): \
+             before={}, after={}",
             ll_before,
             ll_after
         );
@@ -550,16 +561,35 @@ mod tests {
                 distribution: TernaryDistribution::new(0.3, 0.3, 0.4),
             },
         ];
+
+        // Log-likelihood of the *initial* parameters, before any EM update.
+        let ll_init = TernaryEM::new(init.clone()).log_likelihood(&data);
         let result = TernaryEM::new(init).fit(&data);
 
+        // (1) Monotonicity: across iterations the log-likelihood must be
+        // non-decreasing up to floating-point rounding. Exact-arithmetic EM is
+        // monotone, but double precision can wiggle by ~1e-15, so use a tight
+        // documented tolerance rather than claiming bit-exact monotonicity.
         for window in result.ll_history.windows(2) {
             assert!(
-                window[1] >= window[0] - 1e-6,
-                "Log-likelihood should be non-decreasing: {} -> {}",
+                window[1] >= window[0] - 1e-9,
+                "Log-likelihood must be non-decreasing within float tolerance: {} -> {}",
                 window[0],
                 window[1]
             );
         }
+
+        // (2) The fitted model must strictly beat the initial one. This is what
+        // makes the test meaningful: a broken (no-op) M-step that never updates
+        // parameters leaves ll_final == ll_init, which check (1) alone cannot
+        // detect because a flat sequence trivially satisfies non-decreasing.
+        // Here the init is provably improvable, so EM must raise the LL.
+        assert!(
+            result.log_likelihood > ll_init,
+            "EM must strictly improve log-likelihood from the init: init={}, final={}",
+            ll_init,
+            result.log_likelihood
+        );
     }
 
     #[test]
@@ -578,7 +608,10 @@ mod tests {
         let q = TernaryDistribution::new(0.1, 0.3, 0.6);
         let js_pq = js_divergence(&p, &q);
         let js_qp = js_divergence(&q, &p);
-        assert!((js_pq - js_qp).abs() < 1e-10, "JS divergence should be symmetric");
+        assert!(
+            (js_pq - js_qp).abs() < 1e-10,
+            "JS divergence should be symmetric"
+        );
         assert!(js_pq >= 0.0);
     }
 
@@ -606,5 +639,91 @@ mod tests {
         assert!((d.log_pmf(0) - 0.3_f64.ln()).abs() < 1e-10);
         assert!((d.log_pmf(1) - 0.2_f64.ln()).abs() < 1e-10);
         assert_eq!(d.log_pmf(2), f64::NEG_INFINITY);
+    }
+
+    // ── Numerical-stability / degenerate-input coverage ──
+
+    #[test]
+    fn test_floor_keeps_log_likelihood_finite_for_unsupported_value() {
+        // A point-mass component (always -1) seeing a +1 would, without the
+        // floor, make pmf(+1) = 0 and ln(0) = -inf. The floor must keep the
+        // log-likelihood finite and the E-step responsibilities valid.
+        let em = TernaryEM::new(vec![MixtureComponent {
+            weight: 1.0,
+            distribution: TernaryDistribution::new(1.0, 0.0, 0.0),
+        }]);
+        let data = vec![1_i8];
+        let ll = em.log_likelihood(&data);
+        assert!(
+            ll.is_finite(),
+            "floor must prevent -inf log-likelihood, got {ll}"
+        );
+
+        let resp = em.e_step(&data);
+        let sum: f64 = resp[0].iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "responsibilities must still sum to 1"
+        );
+    }
+
+    #[test]
+    fn test_all_identical_data_runs_without_panic() {
+        // Degenerate dataset where every point is identical: the M-step drives
+        // the responsible component toward a point mass. Verify no panic, finite
+        // LL, and that responsibilities remain valid probabilities.
+        let data = vec![0_i8; 50];
+        let result = TernaryEM::new(vec![
+            MixtureComponent {
+                weight: 0.5,
+                distribution: TernaryDistribution::new(0.2, 0.6, 0.2),
+            },
+            MixtureComponent {
+                weight: 0.5,
+                distribution: TernaryDistribution::new(0.3, 0.4, 0.3),
+            },
+        ])
+        .fit(&data);
+
+        assert!(result.log_likelihood.is_finite());
+        // The two near-symmetric components should both concentrate mass on 0.
+        for c in &result.components {
+            assert!(
+                c.distribution.p_zero > 0.9,
+                "components should collapse toward the only observed value (0)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_point_mass_distribution_has_zero_variance() {
+        // A deterministic distribution over {-1, 0, +1} has zero variance and
+        // no division-by-variance anywhere, so this must not be a special case.
+        let d = TernaryDistribution::new(0.0, 1.0, 0.0);
+        assert!(d.variance().abs() < 1e-15);
+        assert!((d.mean()).abs() < 1e-15);
+        assert!((d.pmf(0) - 1.0).abs() < 1e-15);
+        assert!((d.pmf(-1)).abs() < 1e-15);
+        assert!((d.pmf(1)).abs() < 1e-15);
+    }
+
+    #[test]
+    #[should_panic(expected = "Probabilities must sum to a positive number")]
+    fn test_new_rejects_all_zero_probabilities() {
+        // Documented behavior: (0, 0, 0) is not a valid distribution and panics.
+        let _ = TernaryDistribution::new(0.0, 0.0, 0.0);
+    }
+
+    #[test]
+    fn test_js_divergence_bounded_by_ln2() {
+        // JS divergence (equal-weight) is bounded above by ln(2).
+        let p = TernaryDistribution::new(1.0, 0.0, 0.0);
+        let q = TernaryDistribution::new(0.0, 0.0, 1.0);
+        let js = js_divergence(&p, &q);
+        assert!(
+            js <= std::f64::consts::LN_2 + 1e-9,
+            "JS divergence must be bounded by ln(2), got {js}"
+        );
+        assert!(js > 0.0);
     }
 }

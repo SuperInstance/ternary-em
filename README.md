@@ -111,7 +111,7 @@ d.variance();   // 0.7 - 0.09 = 0.61
 d.pmf(-1);      // 0.5
 d.log_pmf(1);   // ln(0.2)
 d.sample(0.1);  // -1 (falls in first 50%)
-d.sample(0.6);  // +1 (falls in last 20%)
+d.sample(0.9);  // +1 (falls in last 20%, i.e. u >= p_neg + p_zero = 0.8)
 
 // ── Uniform distribution ──
 let u = TernaryDistribution::uniform();
